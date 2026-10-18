@@ -2,19 +2,18 @@ name: Run tests
 
 on:
   # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector(s) passed to tox posargs"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
@@ -33,6 +32,13 @@ jobs:
           # See https://github.com/bbangert/beaker/pull/213
           - os: "windows-latest"
             python-version: "3.10"
+          # CPython 3.7 cannot be provisioned on arm64 macos (no prebuilt; source build needs
+          # openssl@1.1, which Homebrew removed) -- run the macos 3.7 leg on the x64 intel runner
+          - os: "macos-latest"
+            python-version: "3.7"
+        include:
+          - os: "macos-15-intel"
+            python-version: "3.7"
 
       fail-fast: false
 
@@ -41,11 +47,14 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v2
 
+      # MatteoH2O1999/setup-python provisions old CPython (3.7) on ubuntu-24.04 / arm64 macos runners where actions/setup-python cannot
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
@@ -53,5 +62,46 @@ jobs:
           pip install --upgrade tox setuptools
           pip list
 
+      # Pygments >= 2.20 stops HTML-escaping `"` in highlighted output, which breaks the
+      # `&quot;` assertions in test/test_exceptions.py; keep tox's test deps on the 2.19 line
+      - name: Constrain Pygments for tests
+        shell: bash
+        run: echo "pygments<2.20" > "$RUNNER_TEMP/test-constraints.txt"
+
       - name: Run tests
-        run: tox
+        env:
+          PIP_CONSTRAINT: ${{ runner.temp }}/test-constraints.txt
+        run: tox -- ${{ inputs.test-filter }}
+
+  build-dist:
+    name: build-sdist-wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install build tooling (pinned to release date 2022-11-15)
+        run: |
+          python -m pip install --index-url 'https://:2022-11-15T14:37:53Z@time-machines-pypi.sealsecurity.io/' build "setuptools==65.5.1" "wheel==0.38.4"
+          pip list
+
+      - name: Build sdist and wheel
+        run: |
+          # setup.cfg carries `[egg_info] tag_build = dev` for dev checkouts; the
+          # release is built with an empty tag (the published sdist's setup.cfg has `tag_build = `)
+          sed -i 's/^tag_build = dev$/tag_build =/' setup.cfg
+          python -m build --no-isolation
+          ls -l dist
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
